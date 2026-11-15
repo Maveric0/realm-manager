@@ -10,9 +10,16 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/Maveric0/realm-manager/main/realm.sh)
 ```
 
+Alpine 默认没有 bash 和 curl，先装上再执行：
+
+```bash
+apk add bash curl
+bash <(curl -fsSL https://raw.githubusercontent.com/Maveric0/realm-manager/main/realm.sh)
+```
+
 安装完成后，以后 SSH 登录直接输入 `realm` 就能进入管理菜单，可以增删改查规则、查看日志、检查更新和卸载。
 
-支持使用 systemd 的 Linux，架构为 x86_64、aarch64、armv7。
+支持使用 systemd 的 Linux（Debian、Ubuntu、RHEL 系等）和使用 OpenRC 的 Alpine，架构为 x86_64、aarch64、armv7。
 
 ## 规则怎么写
 
@@ -22,7 +29,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Maveric0/realm-manager/main/
 
 ## 更新规则为什么不用重启
 
-realm 本身不支持热重载，所以每条规则都运行一个独立的 realm 进程（systemd 实例 `realm-rule@<ID>`）：
+realm 本身不支持热重载，所以每条规则都运行一个独立的 realm 进程（systemd 实例 `realm-rule@<ID>`，Alpine 上是 OpenRC 服务 `realm-rule.<ID>`）：
 
 | 操作 | 影响范围 |
 | --- | --- |
@@ -41,6 +48,14 @@ realm 本身不支持热重载，所以每条规则都运行一个独立的 real
 | `/opt/realm-manager/realm` | realm 程序 |
 | `/etc/realm-manager/rules/<ID>.toml` | 每条规则的配置 |
 | `/etc/systemd/system/realm-rule@.service` | systemd 模板 |
+
+Alpine (OpenRC) 上服务和日志的位置不同：
+
+| 路径 | 用途 |
+| --- | --- |
+| `/etc/init.d/realm-rule` | OpenRC 服务脚本，每条规则是一个指向它的软链接 `realm-rule.<ID>` |
+| `/var/log/realm-manager/<ID>.log` | 每条规则的日志 |
+| `/etc/periodic/daily/realm-manager` | 每天把超过 1MB 的日志截短（依赖 crond），规则每次启动时也会截一次 |
 
 `realm` 命令已被管理脚本占用，带参数调用时会转交给 realm 程序，比如 `realm -v`、`realm -c config.toml` 都能照常使用。如果服务器上已有 `/usr/local/bin/realm`，安装时会备份到 `/opt/realm-manager/realm.orig`，卸载时恢复。
 

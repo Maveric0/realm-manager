@@ -3,7 +3,17 @@
 # https://github.com/Maveric0/realm-manager
 #
 # realm 本身不支持热重载，这里让每条规则独立运行一个 realm 进程
-# (systemd 实例 realm-rule@<ID>)，增删改只影响对应规则，其他规则的连接不中断。
+# (systemd 实例 realm-rule@<ID>，OpenRC 下为 realm-rule.<ID>)，
+# 增删改只影响对应规则，其他规则的连接不中断。
+
+# 被 sh 执行时（Alpine 默认没有 bash），先装上 bash 再换过去。这段只能用 POSIX sh 语法
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -f "$0" ] && [ -z "${REALM_MANAGER_REEXEC:-}" ] && [ "$(id -u)" = 0 ] && command -v apk >/dev/null 2>&1; then
+        apk add -q --no-cache bash && REALM_MANAGER_REEXEC=1 exec bash "$0" "$@"
+    fi
+    echo "请用 bash 运行本脚本，Alpine 可先执行：apk add bash curl" >&2
+    exit 1
+fi
 
 set -uo pipefail
 
@@ -17,7 +27,11 @@ CONF_DIR=/etc/realm-manager
 RULE_DIR=$CONF_DIR/rules
 CMD=/usr/local/bin/realm
 UNIT_FILE=/etc/systemd/system/realm-rule@.service
+OPENRC_SCRIPT=/etc/init.d/realm-rule
+LOG_DIR=/var/log/realm-manager
+LOG_TRIM=/etc/periodic/daily/realm-manager
 MARKER='# realm-manager'
+INIT=''
 
 if [[ -t 1 ]]; then
     C_ACCENT=$'\033[36m' C_OK=$'\033[32m' C_ERR=$'\033[31m' C_DIM=$'\033[2m' C_RESET=$'\033[0m'
@@ -63,9 +77,17 @@ make_tmp() {
     [[ -n $TMP_DIR ]] || TMP_DIR=$(mktemp -d) || die "无法创建临时目录"
 }
 
-ensure_deps() {
-    have systemctl && [[ -d /run/systemd/system ]] || die "本脚本依赖 systemd，当前系统不支持"
+detect_init() {
+    if have systemctl && [[ -d /run/systemd/system ]]; then
+        INIT=systemd
+    elif have openrc-run && have rc-service && [[ -e /run/openrc/softlevel ]]; then
+        INIT=openrc
+    else
+        die "本脚本依赖 systemd 或 OpenRC，当前系统都不支持"
+    fi
+}
 
+ensure_deps() {
     local need=()
     have curl || need+=(curl)
     have tar || need+=(tar)
@@ -77,6 +99,10 @@ ensure_deps() {
         have ss || need+=(iproute)
         ((${#need[@]} == 0)) && return
         if have dnf; then dnf install -y -q "${need[@]}"; else yum install -y -q "${need[@]}"; fi
+    elif have apk; then
+        have ss || need+=(iproute2)
+        ((${#need[@]} == 0)) && return
+        apk add -q --no-cache "${need[@]}"
     else
         have ss || need+=(iproute2)
         ((${#need[@]} == 0)) && return
@@ -86,12 +112,15 @@ ensure_deps() {
 }
 
 realm_targets() {
+    local gnu musl
     case $(uname -m) in
-    x86_64 | amd64) echo x86_64-unknown-linux-gnu-glibc2.28 x86_64-unknown-linux-musl ;;
-    aarch64 | arm64) echo aarch64-unknown-linux-gnu-glibc2.28 aarch64-unknown-linux-musl ;;
-    armv7l) echo armv7-unknown-linux-gnueabihf-glibc2.28 armv7-unknown-linux-musleabihf ;;
+    x86_64 | amd64) gnu=x86_64-unknown-linux-gnu-glibc2.28 musl=x86_64-unknown-linux-musl ;;
+    aarch64 | arm64) gnu=aarch64-unknown-linux-gnu-glibc2.28 musl=aarch64-unknown-linux-musl ;;
+    armv7l) gnu=armv7-unknown-linux-gnueabihf-glibc2.28 musl=armv7-unknown-linux-musleabihf ;;
     *) return 1 ;;
     esac
+    # Alpine 等 musl 系统直接用 musl 版，省一次下载
+    if compgen -G '/lib/ld-musl-*' >/dev/null; then echo "$musl $gnu"; else echo "$gnu $musl"; fi
 }
 
 # 依次尝试 glibc 版和静态 musl 版，取第一个能在本机运行的
@@ -115,7 +144,15 @@ download_realm() {
     return 1
 }
 
-install_unit() {
+install_service() {
+    if [[ $INIT == openrc ]]; then
+        install_openrc
+    else
+        install_systemd
+    fi
+}
+
+install_systemd() {
     cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=Realm forward rule %i
@@ -136,6 +173,116 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_RESOURCE
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
+}
+
+# OpenRC 没有实例模板，靠软链接 realm-rule.<ID> -> realm-rule 区分规则
+install_openrc() {
+    cat >"$OPENRC_SCRIPT" <<EOF
+#!/sbin/openrc-run
+$MARKER
+
+rule_id=\${RC_SVCNAME#realm-rule.}
+description="Realm forward rule \$rule_id"
+command=$BIN
+command_args="-c $RULE_DIR/\$rule_id.toml"
+supervisor=supervise-daemon
+respawn_delay=3
+respawn_max=0
+output_log=$LOG_DIR/\$rule_id.log
+error_log=$LOG_DIR/\$rule_id.log
+
+depend() {
+    use net dns
+    after firewall
+}
+
+start_pre() {
+    if [ "\$rule_id" = "\$RC_SVCNAME" ]; then
+        eerror "请通过 realm-rule.<ID> 启动具体规则"
+        return 1
+    fi
+    checkpath -d -m 0755 $LOG_DIR
+    log=$LOG_DIR/\$rule_id.log
+    if [ -f "\$log" ] && [ "\$(wc -c <"\$log")" -gt 1048576 ]; then
+        tail -n 2000 "\$log" >"\$log.tmp" && mv -f "\$log.tmp" "\$log"
+    fi
+    ulimit -n 524288 2>/dev/null || ulimit -n "\$(ulimit -Hn)"
+}
+EOF
+    chmod 755 "$OPENRC_SCRIPT"
+
+    # 没有 journald 帮忙轮转，每天把超过 1MB 的日志截到最后 2000 行
+    if [[ -d ${LOG_TRIM%/*} ]]; then
+        cat >"$LOG_TRIM" <<EOF
+#!/bin/sh
+$MARKER
+for f in $LOG_DIR/*.log; do
+    [ -f "\$f" ] && [ "\$(wc -c <"\$f")" -gt 1048576 ] || continue
+    tail -n 2000 "\$f" >"\$f.tmp" && cat "\$f.tmp" >"\$f"
+    rm -f "\$f.tmp"
+done
+EOF
+        chmod 755 "$LOG_TRIM"
+    fi
+}
+
+# ---------- 服务控制 ----------
+
+svc_of() {
+    if [[ $INIT == openrc ]]; then
+        printf 'realm-rule.%s' "$1"
+    else
+        printf 'realm-rule@%s.service' "$1"
+    fi
+}
+
+svc_start() { # 启动并设为开机自启
+    local s
+    s=$(svc_of "$1")
+    if [[ $INIT == openrc ]]; then
+        ln -sf realm-rule "/etc/init.d/$s" && rc-update add "$s" default && rc-service "$s" start
+    else
+        systemctl enable --now "$s"
+    fi
+}
+
+svc_remove() { # 停止并取消自启
+    local s
+    s=$(svc_of "$1")
+    if [[ $INIT == openrc ]]; then
+        rc-service "$s" stop
+        rc-update del "$s" default
+        rm -f "/etc/init.d/$s" "$LOG_DIR/$1.log"
+    else
+        systemctl disable --now "$s"
+        systemctl reset-failed "$s"
+    fi
+}
+
+svc_restart() {
+    if [[ $INIT == openrc ]]; then
+        rc-service "$(svc_of "$1")" restart
+    else
+        systemctl restart "$(svc_of "$1")"
+    fi
+}
+
+svc_active() {
+    if [[ $INIT == openrc ]]; then
+        rc-service "$(svc_of "$1")" status >/dev/null 2>&1
+    else
+        systemctl is-active --quiet "$(svc_of "$1")"
+    fi
+}
+
+svc_log() { # <ID> <行数> [plain]
+    if [[ $INIT == openrc ]]; then
+        tail -n "$2" "$LOG_DIR/$1.log" 2>/dev/null
+    elif [[ ${3-} == plain ]]; then
+        journalctl -u "$(svc_of "$1")" -n "$2" --no-pager -o cat 2>/dev/null
+    else
+        journalctl -u "$(svc_of "$1")" -n "$2" --no-pager
+    fi
 }
 
 fetch_script() {
@@ -162,7 +309,11 @@ install_self() {
     fi
 }
 
-is_installed() { [[ -x $BIN && -f $UNIT_FILE ]] && grep -qs "^$MARKER" "$CMD"; }
+is_installed() {
+    local tpl=$UNIT_FILE
+    [[ $INIT == openrc ]] && tpl=$OPENRC_SCRIPT
+    [[ -x $BIN && -f $tpl ]] && grep -qs "^$MARKER" "$CMD"
+}
 
 install_all() {
     ensure_deps
@@ -170,7 +321,7 @@ install_all() {
     if [[ ! -x $BIN ]]; then
         download_realm || die "下载 realm 失败。若服务器访问 GitHub 受限，可设置镜像后重试，例如：GH_PROXY=https://你的镜像/ bash realm.sh"
     fi
-    install_unit
+    install_service
     install_self || die "安装 $CMD 失败"
     ok "安装完成，以后直接输入 realm 即可进入管理菜单"
 }
@@ -178,7 +329,6 @@ install_all() {
 # ---------- 规则文件 ----------
 
 rule_file() { printf '%s/%s.toml' "$RULE_DIR" "$1"; }
-unit_of() { printf 'realm-rule@%s.service' "$1"; }
 
 rule_ids() {
     local f
@@ -379,7 +529,7 @@ wait_rule() { # <ID> <端口> <协议>
     local id=$1 port=$2 proto=$3 i t ready
     for ((i = 0; i < 25; i++)); do
         ready=1
-        systemctl is-active --quiet "$(unit_of "$id")" || ready=0
+        svc_active "$id" || ready=0
         for t in tcp udp; do
             [[ $proto == *$t* ]] || continue
             listening "$t" "$port" || ready=0
@@ -392,7 +542,7 @@ wait_rule() { # <ID> <端口> <协议>
 
 show_failure() {
     err "规则 $1 启动失败，最近日志："
-    journalctl -u "$(unit_of "$1")" -n 8 --no-pager -o cat 2>/dev/null | sed 's/^/  /' >&2
+    svc_log "$1" 8 plain | sed 's/^/  /' >&2
 }
 
 firewall_hint() { # <端口> <协议>
@@ -426,7 +576,7 @@ list_rules() {
     printf '%-4s %-24s %-28s %-8s %s\n' ID LISTEN REMOTE PROTO '状态  备注'
     for id in $ids; do
         proto=$(rule_proto "$id")
-        if systemctl is-active --quiet "$(unit_of "$id")"; then
+        if svc_active "$id"; then
             state="${C_OK}运行${C_RESET}"
         else
             state="${C_ERR}停止${C_RESET}"
@@ -449,13 +599,13 @@ add_rule() {
     id=$(next_id)
     file=$(rule_file "$id")
     write_rule "$file" "$LISTEN" "$REMOTE" "$PROTO" "$REMARK"
-    if systemctl enable --now "$(unit_of "$id")" >/dev/null 2>&1 && wait_rule "$id" "$port" "$PROTO"; then
+    if svc_start "$id" >/dev/null 2>&1 && wait_rule "$id" "$port" "$PROTO"; then
         ok "已添加，其他规则未受影响"
         show_rule_summary "$id"
         firewall_hint "$port" "$PROTO"
     else
         show_failure "$id"
-        systemctl disable --now "$(unit_of "$id")" >/dev/null 2>&1
+        svc_remove "$id" >/dev/null 2>&1
         rm -f "$file"
         err "已撤销这条规则"
     fi
@@ -503,14 +653,14 @@ edit_rule() {
     backup=$TMP_DIR/rule-$id.toml
     cp "$file" "$backup"
     write_rule "$file" "$LISTEN" "$REMOTE" "$PROTO" "$REMARK"
-    if systemctl restart "$(unit_of "$id")" 2>/dev/null && wait_rule "$id" "$port" "$PROTO"; then
+    if svc_restart "$id" >/dev/null 2>&1 && wait_rule "$id" "$port" "$PROTO"; then
         ok "已更新，只有规则 $id 自身的连接被重置"
         show_rule_summary "$id"
         firewall_hint "$port" "$PROTO"
     else
         show_failure "$id"
         cp "$backup" "$file"
-        systemctl restart "$(unit_of "$id")" 2>/dev/null
+        svc_restart "$id" >/dev/null 2>&1
         err "修改未生效，规则 $id 已恢复原配置"
     fi
 }
@@ -520,15 +670,14 @@ delete_rule() {
     local id=$RULE_ID
     show_rule_summary "$id"
     confirm "确认删除" || return
-    systemctl disable --now "$(unit_of "$id")" >/dev/null 2>&1
-    systemctl reset-failed "$(unit_of "$id")" >/dev/null 2>&1
+    svc_remove "$id" >/dev/null 2>&1
     rm -f "$(rule_file "$id")"
     ok "已删除，其他规则未受影响"
 }
 
 show_logs() {
     pick_rule || return
-    journalctl -u "$(unit_of "$RULE_ID")" -n 30 --no-pager
+    svc_log "$RULE_ID" 30 || hint "暂无日志"
 }
 
 # ---------- 维护 ----------
@@ -569,7 +718,7 @@ update_all() {
     hint "运行中的规则继续使用旧版本，直到各自重启"
     if [[ -n $(rule_ids) ]] && confirm "现在重启全部规则以使用新版本？所有连接会短暂中断"; then
         for id in $(rule_ids); do
-            systemctl restart "$(unit_of "$id")"
+            svc_restart "$id" >/dev/null 2>&1 || err "规则 $id 重启失败"
         done
         ok "已重启全部规则"
     fi
@@ -580,11 +729,16 @@ uninstall() {
     confirm "确认卸载？全部规则会被删除，转发立即停止" || return
     local id
     for id in $(rule_ids); do
-        systemctl disable --now "$(unit_of "$id")" >/dev/null 2>&1
-        systemctl reset-failed "$(unit_of "$id")" >/dev/null 2>&1
+        svc_remove "$id" >/dev/null 2>&1
     done
-    rm -f "$UNIT_FILE" "$CMD"
-    systemctl daemon-reload
+    if [[ $INIT == openrc ]]; then
+        rm -f "$OPENRC_SCRIPT" "$LOG_TRIM"
+        rm -rf "$LOG_DIR"
+    else
+        rm -f "$UNIT_FILE"
+        systemctl daemon-reload
+    fi
+    rm -f "$CMD"
     [[ -f $APP_DIR/realm.orig ]] && mv -f "$APP_DIR/realm.orig" "$CMD"
     rm -rf "$APP_DIR" "$CONF_DIR"
     ok "已卸载"
@@ -625,6 +779,7 @@ main() {
         [[ -f $0 ]] && have sudo && exec sudo bash "$0"
         die "请使用 root 运行"
     fi
+    detect_init
 
     # curl | bash 时标准输入是脚本本身，交互要改从终端读
     if [[ ! -t 0 && ! -f $0 ]] && { : </dev/tty; } 2>/dev/null; then
