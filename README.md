@@ -13,7 +13,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Maveric0/realm-manager/main/
 Alpine 默认没有 bash 和 curl，先装上再执行：
 
 ```bash
-apk add bash curl
+apk add --no-cache bash curl
 bash <(curl -fsSL https://raw.githubusercontent.com/Maveric0/realm-manager/main/realm.sh)
 ```
 
