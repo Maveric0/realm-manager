@@ -152,13 +152,15 @@ install_service() {
     fi
 }
 
-install_systemd() {
-    cat >"$UNIT_FILE" <<EOF
+# 开机时监听地址可能还没就绪，realm 会启动失败；不设启动次数上限，一直重试到成功
+systemd_unit() {
+    cat <<EOF
 [Unit]
 Description=Realm forward rule %i
 Documentation=https://github.com/Maveric0/realm-manager
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -172,12 +174,16 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_RESOURCE
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+install_systemd() {
+    systemd_unit >"$UNIT_FILE"
     systemctl daemon-reload
 }
 
 # OpenRC 没有实例模板，靠软链接 realm-rule.<ID> -> realm-rule 区分规则
-install_openrc() {
-    cat >"$OPENRC_SCRIPT" <<EOF
+openrc_script() {
+    cat <<EOF
 #!/sbin/openrc-run
 $MARKER
 
@@ -209,6 +215,10 @@ start_pre() {
     ulimit -n 524288 2>/dev/null || ulimit -n "\$(ulimit -Hn)"
 }
 EOF
+}
+
+install_openrc() {
+    openrc_script >"$OPENRC_SCRIPT"
     chmod 755 "$OPENRC_SCRIPT"
 
     # 没有 journald 帮忙轮转，每天把超过 1MB 的日志截到最后 2000 行
@@ -226,6 +236,15 @@ EOF
     fi
 }
 
+# 已安装的服务模板和当前脚本生成的是否一致，旧版本升级上来时不一致，需要重写
+service_current() {
+    if [[ $INIT == openrc ]]; then
+        [[ $(openrc_script) == "$(cat "$OPENRC_SCRIPT" 2>/dev/null)" ]]
+    else
+        [[ $(systemd_unit) == "$(cat "$UNIT_FILE" 2>/dev/null)" ]]
+    fi
+}
+
 # ---------- 服务控制 ----------
 
 svc_of() {
@@ -236,11 +255,31 @@ svc_of() {
     fi
 }
 
+svc_enable() { # 只设为开机自启，不动正在运行的进程
+    local s
+    s=$(svc_of "$1")
+    if [[ $INIT == openrc ]]; then
+        # OpenRC 按秒比较修改时间来决定要不要重建依赖缓存，同一秒内新建的软链接会被漏掉，
+        # 漏掉的服务开机时不会启动，所以每次都强制重建
+        ln -sf realm-rule "/etc/init.d/$s" && rc-update add "$s" default && rc-update -u
+    else
+        systemctl enable "$s"
+    fi
+}
+
+svc_enabled() {
+    if [[ $INIT == openrc ]]; then
+        [[ -e /etc/runlevels/default/$(svc_of "$1") ]]
+    else
+        systemctl is-enabled --quiet "$(svc_of "$1")"
+    fi
+}
+
 svc_start() { # 启动并设为开机自启
     local s
     s=$(svc_of "$1")
     if [[ $INIT == openrc ]]; then
-        ln -sf realm-rule "/etc/init.d/$s" && rc-update add "$s" default && rc-service "$s" start
+        svc_enable "$1" && rc-service "$s" start
     else
         systemctl enable --now "$s"
     fi
@@ -253,6 +292,7 @@ svc_remove() { # 停止并取消自启
         rc-service "$s" stop
         rc-update del "$s" default
         rm -f "/etc/init.d/$s" "$LOG_DIR/$1.log"
+        rc-update -u
     else
         systemctl disable --now "$s"
         systemctl reset-failed "$s"
@@ -564,6 +604,29 @@ show_rule_summary() { # <ID>
     printf '规则 %s：%s -> %s (%s)\n' "$1" "$(rule_listen "$1")" "$(rule_remote "$1")" "${proto^^}"
 }
 
+# 每条规则都应当在运行并且开机自启，进菜单时把不符合的补上：
+# 被手动 disable 过的、从别处搬来的规则文件、旧版本在 OpenRC 上重启后没起来的规则
+ensure_rules() {
+    local id listen
+    [[ $INIT == openrc ]] && rc-update -u >/dev/null 2>&1
+    for id in $(rule_ids); do
+        if ! svc_enabled "$id"; then
+            if svc_enable "$id" >/dev/null 2>&1 && svc_enabled "$id"; then
+                ok "规则 $id 之前没有设为开机自启，已补上"
+            else
+                err "规则 $id 设置开机自启失败"
+            fi
+        fi
+        svc_active "$id" && continue
+        listen=$(rule_listen "$id")
+        if svc_start "$id" >/dev/null 2>&1 && wait_rule "$id" "${listen##*:}" "$(rule_proto "$id")"; then
+            ok "规则 $id 之前没在运行，已启动"
+        else
+            err "规则 $id 没在运行，启动失败，可用 4 查看日志"
+        fi
+    done
+}
+
 # ---------- 增删改查 ----------
 
 list_rules() {
@@ -581,6 +644,7 @@ list_rules() {
         else
             state="${C_ERR}停止${C_RESET}"
         fi
+        svc_enabled "$id" || state+=" ${C_ERR}未自启${C_RESET}"
         remark=$(rule_remark "$id")
         printf '%-4s %-24s %-28s %-8s %s  %s\n' "$id" "$(rule_listen "$id")" "$(rule_remote "$id")" "${proto^^}" "$state" "$remark"
     done
@@ -789,7 +853,10 @@ main() {
     # 经一键命令重新运行时顺带刷新已安装的脚本
     if ! is_installed || [[ ! $0 -ef $CMD ]]; then
         install_all
+    elif ! service_current; then
+        install_service
     fi
+    ensure_rules
     menu
 }
 
